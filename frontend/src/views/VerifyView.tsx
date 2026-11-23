@@ -21,20 +21,15 @@ import { EventList } from '../components/EventList'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
 import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import VerificationTimeline from '../components/VerificationTimeline'
+import { VerificationDetailExplorer } from '../components/VerificationDetailExplorer'
+import { buildVerificationDetails } from '../services/verificationFlow'
 import { shortHash } from '../utils'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
 import { CONTRACT_NETWORK_PASSPHRASE } from '../stellar'
 import type { VerificationShareLinkInput } from '../verificationShareLink'
 import { tryParseManifest } from '../batchVerifier'
-import {
-  buildVerificationDimensions,
-  createCachedVerificationEntry,
-  resolveCachedVerificationResult,
-  type CachedVerificationEntry,
-  type TrustDimensionState,
-  type VerificationContextIdentity,
-} from '../services/verificationFlow'
+import { createVerificationRevisionGuard } from '../services/verificationFlow'
 
 const CONTRACT_ID = import.meta.env.VITE_HARPOCRATES_REGISTRY_ID ?? ''
 const MAX_MANIFEST_SIZE_BYTES = 64 * 1024 // 64 KB cap
@@ -92,6 +87,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
 
   const inputRef = useRef<HTMLInputElement | null>(null)
   const manifestInputRef = useRef<HTMLInputElement | null>(null)
+  const selectionRevisionRef = useRef(createVerificationRevisionGuard())
   const [videoHashInput, setVideoHashInput] = useState('')
   const [proofIdInput, setProofIdInput] = useState('')
   const [manifestError, setManifestError] = useState<string | null>(null)
@@ -104,12 +100,16 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
   }, [verifyHash, videoHashInput])
 
   const handleManifestFile = async (file: File) => {
+    const revision = selectionRevisionRef.current.next()
     if (file.size > MAX_MANIFEST_SIZE_BYTES) {
       setManifestError(`Manifest file exceeds the 64 KB size limit (${(file.size / 1024).toFixed(1)} KB).`)
       return
     }
 
     const manifest = await tryParseManifest(file)
+    if (!selectionRevisionRef.current.isCurrent(revision)) {
+      return
+    }
     if (!manifest) {
       setManifestError('Invalid or malformed proof manifest JSON.')
       return
@@ -139,6 +139,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     const vHash = videoHashInput.trim()
     const pId = proofIdInput.trim()
     if (!vHash) return
+    selectionRevisionRef.current.invalidate()
     setManifestError(null)
     if (typeof loadSharedVerification === 'function') {
       void loadSharedVerification({
@@ -266,6 +267,36 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     })
   }, [effectiveStatus, verifyResult, chainProof, events, offline, errorCode])
 
+  const verificationDetails = useMemo(() => {
+    const activeHash = videoHashInput || verifyHash
+    return buildVerificationDetails({
+      videoHash: activeHash,
+      hasHarpocratesMetadata:
+        offline
+          ? status === 'success' && !errorCode
+          : status === 'success' || events.length > 0,
+      events,
+      onChain: chainProof,
+      proofId: proofIdInput || revocationProofId,
+      tier: shareLinkInput?.tier,
+      metadataHash: chainProof?.metadataHash || provenanceRecord?.metadata.metadataHash || null,
+      offline,
+      errorCode,
+    })
+  }, [
+    videoHashInput,
+    verifyHash,
+    offline,
+    status,
+    errorCode,
+    events,
+    chainProof,
+    proofIdInput,
+    revocationProofId,
+    shareLinkInput?.tier,
+    provenanceRecord?.metadata.metadataHash,
+  ])
+
   return (
     <section className="workspace app-page verify-page" id="verify">
       <div className="studio verify-studio">
@@ -314,6 +345,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               if (f.name.endsWith('.json') || f.type === 'application/json') {
                 void handleManifestFile(f)
               } else {
+                selectionRevisionRef.current.invalidate()
                 void verifyEvidence(f, wallet || undefined)
               }
             }
@@ -337,6 +369,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
             disabled={isVerifying}
             onChange={(event) => {
               const f = event.target.files?.[0] ?? null
+              selectionRevisionRef.current.invalidate()
               void verifyEvidence(f, wallet || undefined)
               // allow re-selecting the same file
               event.target.value = ''
@@ -409,6 +442,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               name="videoHash"
               value={videoHashInput}
               onChange={(e) => {
+                selectionRevisionRef.current.invalidate()
                 setVideoHashInput(e.target.value)
                 setManifestError(null)
               }}
@@ -425,6 +459,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               name="proofId"
               value={proofIdInput}
               onChange={(e) => {
+                selectionRevisionRef.current.invalidate()
                 setProofIdInput(e.target.value)
                 setManifestError(null)
               }}
@@ -552,7 +587,10 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
             <button
               type="button"
               className="hero-secondary verify-action-btn"
-              onClick={cancel}
+              onClick={() => {
+                selectionRevisionRef.current.invalidate()
+                cancel()
+              }}
               aria-label="Cancel verification"
             >
               Cancel
@@ -574,6 +612,7 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               type="button"
               className="hero-secondary verify-action-btn"
               onClick={() => {
+                selectionRevisionRef.current.invalidate()
                 setVideoHashInput('')
                 setProofIdInput('')
                 setManifestError(null)
@@ -595,6 +634,8 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
         ) : (
           <ShareVerificationLink input={shareLinkInput} />
         )}
+
+        <VerificationDetailExplorer details={verificationDetails} />
 
         <dl className="data-list">
           <div>
