@@ -451,150 +451,162 @@ describe('VerifyView – portable proof manifest loading', () => {
   })
 })
 
-// ─── Unknown Issuer Trust vs Invalid Signature ──────────────────────────────
+// ─── Structured Trust Dimensions ────────────────────────────────────────────
 
-describe('VerifyView – unknown issuer trust vs invalid signature', () => {
-  const ISSUER_ADDRESS = `G${'B'.repeat(STELLAR_STRKEY_LENGTH - 1)}`
-  const SEAL_CHAIN_PROOF: ChainProofRecord = {
-    videoHash: 'a'.repeat(64),
-    metadataHash: 'b'.repeat(64),
-    tier: 3,
-    status: 1,
-    createdAt: '1700000000',
-    expiresAt: 0,
-    source: null,
-    issuer: ISSUER_ADDRESS,
-  }
-
-  it('explains UNKNOWN_ISSUER separately from an invalid signature while keeping the underlying proof result visible', () => {
-    mockedUseIssuerTrust.mockReturnValue(
-      issuerTrustStub({
-        state: 'unknown',
-        label: 'Issuer unknown',
-        description: 'The registry has no issuer record for this address.',
-        severity: 'caution',
-        issuer: ISSUER_ADDRESS,
-      }),
-    )
-
+describe('VerifyView – structured trust dimensions', () => {
+  it('renders all four independent trust dimensions on a confirmed verification', () => {
     renderView({
       status: 'success',
       verifyHash: 'a'.repeat(64),
       verifyResult:
         'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
-      chainProof: SEAL_CHAIN_PROOF,
+      chainProof: {
+        videoHash: 'a'.repeat(64),
+        metadataHash: 'b'.repeat(64),
+        tier: 1,
+        status: 1,
+        createdAt: '2026-01-01T00:00:00Z',
+        expiresAt: 0,
+        source: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        issuer: null,
+      },
     })
 
-    // Underlying proof result remains visible
-    expect(
-      screen.getByText(
-        /Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records\./i,
-      ),
-    ).toBeInTheDocument()
-
-    // Dedicated trust explanation separates unknown issuer from invalid signature
-    const explanation = screen.getByTestId('issuer-trust-explanation')
-    expect(explanation).toHaveAttribute('data-trust-code', 'UNKNOWN_ISSUER')
-    expect(explanation).toHaveAttribute('data-severity', 'caution')
-    expect(explanation).toHaveTextContent(/Unknown issuer \(not in trust registry\)/i)
-    expect(explanation).toHaveTextContent(/UNKNOWN_ISSUER/)
-    expect(explanation).toHaveTextContent(/not an invalid signature/i)
+    const section = screen.getByRole('region', { name: /verification trust dimensions/i })
+    expect(section).toHaveAttribute('data-overall-verdict', 'verified')
+    expect(screen.getByText('Content Integrity')).toBeInTheDocument()
+    expect(screen.getByText('Chain Registration')).toBeInTheDocument()
+    expect(screen.getByText('Issuer Trust')).toBeInTheDocument()
+    expect(screen.getByText('Freshness')).toBeInTheDocument()
   })
 
-  it('explains INVALID_SIGNATURE separately from unknown issuer trust and keeps the failure result visible', () => {
-    mockedUseIssuerTrust.mockReturnValue(
-      issuerTrustStub({
-        state: 'unknown',
-        label: 'Issuer unknown',
-        severity: 'caution',
-        issuer: ISSUER_ADDRESS,
-      }),
-    )
-
+  it('surfaces a failed dimension without allowing successful dimensions to mask it', () => {
     renderView({
       status: 'error',
-      errorCode: 'INVALID_EVIDENCE',
+      errorCode: 'EXPIRED_EVIDENCE',
       verifyHash: 'a'.repeat(64),
-      verifyResult: 'Invalid evidence: the file could not be verified as Harpocrates evidence.',
-      chainProof: SEAL_CHAIN_PROOF,
+      verifyResult:
+        'Expired: the chain record for this artifact has expired. Do not treat it as valid evidence.',
+      chainProof: {
+        videoHash: 'a'.repeat(64),
+        metadataHash: 'b'.repeat(64),
+        tier: 1,
+        status: 3,
+        createdAt: '2025-01-01T00:00:00Z',
+        expiresAt: 1_700_000_000,
+        source: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        issuer: null,
+      },
     })
 
-    // Underlying proof failure and error code remain visible
+    const section = screen.getByRole('region', { name: /verification trust dimensions/i })
+    expect(section).toHaveAttribute('data-overall-verdict', 'failed')
     expect(
-      screen.getByText(/Invalid evidence: the file could not be verified as Harpocrates evidence\./i),
+      screen.getByText(/successful dimensions do not override failures/i),
     ).toBeInTheDocument()
-    expect(screen.getByText(/Code: INVALID_EVIDENCE/i)).toBeInTheDocument()
-
-    // Trust explanation stays fail-closed as INVALID_SIGNATURE, not UNKNOWN_ISSUER
-    const explanation = screen.getByTestId('issuer-trust-explanation')
-    expect(explanation).toHaveAttribute('data-trust-code', 'INVALID_SIGNATURE')
-    expect(explanation).toHaveAttribute('data-severity', 'critical')
-    expect(explanation).toHaveTextContent(/Invalid signature or proof binding/i)
-    expect(explanation).toHaveTextContent(/cryptographic verification failure/i)
-  })
-
-  it('explains METADATA_ENVELOPE_MISMATCH as INVALID_SIGNATURE while keeping the mismatch message visible', () => {
-    renderView({
-      status: 'error',
-      errorCode: 'METADATA_ENVELOPE_MISMATCH',
-      verifyHash: 'a'.repeat(64),
-      verifyResult:
-        'Metadata mismatch: the embedded metadata hash does not match the on-chain envelope bound to this proof. Treat this artifact as tampered with.',
-      chainProof: SEAL_CHAIN_PROOF,
-    })
-
-    expect(screen.getByText(/Metadata mismatch:/i)).toBeInTheDocument()
-    expect(screen.getByText(/Code: METADATA_ENVELOPE_MISMATCH/i)).toBeInTheDocument()
-    expect(screen.getByTestId('issuer-trust-explanation')).toHaveAttribute(
-      'data-trust-code',
-      'INVALID_SIGNATURE',
+    expect(section.querySelector('[data-dimension="chainRegistration"]')).toHaveAttribute(
+      'data-state',
+      'verified',
+    )
+    expect(section.querySelector('[data-dimension="freshness"]')).toHaveAttribute(
+      'data-state',
+      'failed',
     )
   })
+})
 
-  it('handles ISSUER_LOOKUP_UNAVAILABLE fail-closed without conflating it with unknown issuer or invalid signature', () => {
-    mockedUseIssuerTrust.mockReturnValue(
-      issuerTrustStub({
-        state: 'unavailable',
-        label: 'Issuer lookup unavailable',
-        severity: 'caution',
-        issuer: ISSUER_ADDRESS,
-      }),
-    )
-
-    renderView({
+describe('VerifyView – stale verification link cache guard', () => {
+  it('suppresses a cached success banner after editing the video hash and requires a fresh result', async () => {
+    const user = userEvent.setup()
+    const initialHook = makeHook({
       status: 'success',
       verifyHash: 'a'.repeat(64),
-      verifyResult:
-        'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
-      chainProof: SEAL_CHAIN_PROOF,
+      verifyResult: 'Public verification record loaded. Confirm the embedded artifact before treating it as authentic.',
     })
+    const { rerender } = render(
+      <VerifyView
+        wallet=""
+        networkMismatch={null}
+        verification={initialHook}
+        provenanceRecord={null}
+      />,
+    )
 
-    expect(screen.getByText(/Confirmed: embedded Harpocrates metadata/i)).toBeInTheDocument()
-    const explanation = screen.getByTestId('issuer-trust-explanation')
-    expect(explanation).toHaveAttribute('data-trust-code', 'ISSUER_LOOKUP_UNAVAILABLE')
-    expect(explanation).toHaveTextContent(/neither an unknown issuer nor an invalid signature/i)
+    expect(
+      screen.getByText(/public verification record loaded/i),
+    ).toBeInTheDocument()
+
+    const hashInput = screen.getByLabelText(/video hash/i)
+    await user.clear(hashInput)
+    await user.type(hashInput, 'f'.repeat(64))
+
+    expect(
+      screen.queryByText(/public verification record loaded/i),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText(/verification context changed\. run a fresh verification/i),
+    ).toBeInTheDocument()
+
+    // A fresh explicit verification result for the new hash restores the banner
+    rerender(
+      <VerifyView
+        wallet=""
+        networkMismatch={null}
+        verification={makeHook({
+          status: 'success',
+          verifyHash: 'f'.repeat(64),
+          verifyResult: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+        })}
+        provenanceRecord={null}
+      />,
+    )
+
+    expect(
+      screen.getByText(/confirmed: embedded harpocrates metadata/i),
+    ).toBeInTheDocument()
   })
 
-  it('preserves identity tier separation for Tier 1 proofs without an institutional issuer', () => {
-    mockedUseIssuerTrust.mockReturnValue(issuerTrustStub({ state: 'unsupported', issuer: null }))
-
-    renderView({
+  it('suppresses a cached success banner when offline mode or network mismatch changes the trust snapshot', () => {
+    const baseHook = makeHook({
       status: 'success',
       verifyHash: 'a'.repeat(64),
-      verifyResult:
-        'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
-      chainProof: { ...SEAL_CHAIN_PROOF, tier: 1, issuer: null },
+      verifyResult: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+      offline: false,
     })
 
-    expect(screen.getByText(/Confirmed: embedded Harpocrates metadata/i)).toBeInTheDocument()
-    expect(screen.getByTestId('issuer-trust-explanation')).toHaveAttribute(
-      'data-trust-code',
-      'NO_ISSUER_REQUIRED',
+    const { rerender } = render(
+      <VerifyView
+        wallet=""
+        networkMismatch={null}
+        verification={baseHook}
+        provenanceRecord={null}
+      />,
     )
-  })
 
-  it('does not render a trust explanation in idle state before any verification run', () => {
-    renderView({ status: 'idle', chainProof: null, errorCode: null })
-    expect(screen.queryByTestId('issuer-trust-explanation')).not.toBeInTheDocument()
+    expect(screen.getByText(/confirmed: embedded harpocrates metadata/i)).toBeInTheDocument()
+
+    // Switching trust snapshot to offline invalidates the cached online success banner
+    rerender(
+      <VerifyView
+        wallet=""
+        networkMismatch={null}
+        verification={{ ...baseHook, offline: true }}
+        provenanceRecord={null}
+      />,
+    )
+    expect(screen.queryByText(/confirmed: embedded harpocrates metadata/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/verification context changed/i)).toBeInTheDocument()
+
+    // An active network mismatch also blocks the cached success banner
+    rerender(
+      <VerifyView
+        wallet=""
+        networkMismatch="Wallet is connected to Mainnet instead of Testnet."
+        verification={baseHook}
+        provenanceRecord={null}
+      />,
+    )
+    expect(screen.queryByText(/confirmed: embedded harpocrates metadata/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/resolve the network mismatch and run a fresh verification/i)).toBeInTheDocument()
   })
 })

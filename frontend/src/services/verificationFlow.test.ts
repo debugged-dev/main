@@ -1,20 +1,14 @@
-/**
- * Focused tests for verificationFlow — stable trust reason code mapping,
- * unknown issuer vs invalid signature separation, and flow orchestration.
- * Uses synthetic fixtures and mocked services only.
- */
-
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ChainProofRecord } from '../stellarTypes'
-import { STELLAR_STRKEY_LENGTH } from '../provenance/issuerTrust'
 import {
-  TRUST_REASON_COPY,
-  explainVerificationTrust,
-  getTrustReasonCopy,
-  resolveTrustReasonCode,
+  buildVerificationContextKey,
+  buildVerificationDimensions,
+  createCachedVerificationEntry,
+  isVerificationContextCompatible,
+  resolveCachedVerificationResult,
   runVerificationFlow,
   verifyUploadedVideo,
-  type TrustReasonCode,
+  type VerificationContextIdentity,
 } from './verificationFlow'
 
 vi.mock('./verificationService', () => ({
@@ -23,210 +17,273 @@ vi.mock('./verificationService', () => ({
   getOnChainProof: vi.fn(),
 }))
 
+import {
+  extractMetadata,
+  fetchProofEventsByVideo,
+  getOnChainProof,
+} from './verificationService'
+
 const VALID_HASH = 'a'.repeat(64)
-const ACCOUNT_ISSUER = `G${'B'.repeat(STELLAR_STRKEY_LENGTH - 1)}`
 
-const SEAL_PROOF: ChainProofRecord = {
-  videoHash: VALID_HASH,
-  metadataHash: 'b'.repeat(64),
-  tier: 3,
-  status: 1,
-  createdAt: '1700000000',
-  expiresAt: 0,
-  source: null,
-  issuer: ACCOUNT_ISSUER,
+function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+  return {
+    videoHash: VALID_HASH,
+    metadataHash: 'b'.repeat(64),
+    tier: 2,
+    status: 1,
+    createdAt: '2026-01-01T00:00:00Z',
+    expiresAt: 2_000_000_000,
+    source: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+    issuer: 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQW2',
+    ...overrides,
+  }
 }
 
-const SILENT_PROOF: ChainProofRecord = {
-  ...SEAL_PROOF,
-  tier: 1,
-  issuer: null,
-}
+describe('buildVerificationDimensions', () => {
+  it('marks overall verified when all four trust dimensions pass', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
+    })
 
-const ALL_REASON_CODES: TrustReasonCode[] = [
-  'TRUSTED_ISSUER',
-  'UNKNOWN_ISSUER',
-  'REVOKED_ISSUER',
-  'EXPIRED_ENDORSEMENT',
-  'INVALID_SIGNATURE',
-  'MALFORMED_ISSUER',
-  'ISSUER_LOOKUP_UNAVAILABLE',
-  'NO_ISSUER_REQUIRED',
-  'ISSUER_CHECK_PENDING',
-  'OFFLINE_NOT_CHECKED',
-]
-
-afterEach(() => {
-  vi.clearAllMocks()
-})
-
-describe('TRUST_REASON_COPY and getTrustReasonCopy', () => {
-  it('provides distinct, accessible, privacy-safe copy for every stable reason code', () => {
-    const headings = new Set<string>()
-    for (const code of ALL_REASON_CODES) {
-      const copy = getTrustReasonCopy(code)
-      expect(copy).toBe(TRUST_REASON_COPY[code])
-      expect(copy.code).toBe(code)
-      expect(copy.heading.length).toBeGreaterThan(0)
-      expect(copy.explanation.length).toBeGreaterThan(copy.heading.length)
-      expect(copy.signatureDistinction.length).toBeGreaterThan(0)
-      expect(copy.explanation).not.toMatch(/rpc|stack|http|exception/i)
-      headings.add(copy.heading)
-    }
-    expect(headings.size).toBe(ALL_REASON_CODES.length)
+    expect(result.overall).toBe('verified')
+    expect(result.hasFailure).toBe(false)
+    expect(result.failedDimensions).toEqual([])
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
   })
 
-  it('explains UNKNOWN_ISSUER separately from an invalid signature', () => {
-    const unknown = getTrustReasonCopy('UNKNOWN_ISSUER')
-    const invalidSig = getTrustReasonCopy('INVALID_SIGNATURE')
+  it('treats silent tier issuer trust as not_applicable without failing overall verdict', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: makeChainProof({ tier: 0, issuer: null, source: null, expiresAt: 0 }),
+    })
 
-    expect(unknown.severity).toBe('caution')
-    expect(unknown.isAlert).toBe(false)
-    expect(unknown.signatureDistinction).toMatch(/not an invalid signature/i)
-    expect(unknown.signatureDistinction).toMatch(/underlying proof result/i)
-
-    expect(invalidSig.severity).toBe('critical')
-    expect(invalidSig.isAlert).toBe(true)
-    expect(invalidSig.explanation).toMatch(/signature or proof binding failed/i)
-    expect(invalidSig.signatureDistinction).toMatch(/separate from.*issuer/i)
+    expect(result.overall).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('not_applicable')
+    expect(result.dimensions.issuerTrust.code).toBe('SILENT_TIER_NO_ISSUER')
+    expect(result.dimensions.freshness.state).toBe('verified')
   })
 
-  it('explains ISSUER_LOOKUP_UNAVAILABLE as neither unknown issuer nor invalid signature', () => {
-    const unavailable = getTrustReasonCopy('ISSUER_LOOKUP_UNAVAILABLE')
+  it('does not let valid content, chain, and issuer mask an expired freshness failure', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: makeChainProof({ expiresAt: 1_800_000_000 }),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
+    })
 
-    expect(unavailable.severity).toBe('caution')
-    expect(unavailable.isAlert).toBe(false)
-    expect(unavailable.explanation).toMatch(/no institutional trust decision was made/i)
-    expect(unavailable.signatureDistinction).toMatch(/neither an unknown issuer nor an invalid signature/i)
-  })
-})
-
-describe('resolveTrustReasonCode', () => {
-  it('maps unknown issuer trust to UNKNOWN_ISSUER when proof verification succeeded', () => {
-    expect(
-      resolveTrustReasonCode({
-        status: 'success',
-        errorCode: null,
-        issuerTrustState: 'unknown',
-        chainProof: SEAL_PROOF,
-      }),
-    ).toBe('UNKNOWN_ISSUER')
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('failed')
+    expect(result.dimensions.freshness.code).toBe('RECORD_EXPIRED')
+    expect(result.overall).toBe('failed')
+    expect(result.hasFailure).toBe(true)
+    expect(result.failedDimensions).toEqual(['freshness'])
   })
 
-  it('maps INVALID_EVIDENCE and METADATA_ENVELOPE_MISMATCH to INVALID_SIGNATURE (fail-closed)', () => {
-    expect(
-      resolveTrustReasonCode({
-        status: 'error',
-        errorCode: 'INVALID_EVIDENCE',
-        issuerTrustState: 'unknown',
-        chainProof: SEAL_PROOF,
-      }),
-    ).toBe('INVALID_SIGNATURE')
+  it('does not let valid content, chain, and freshness mask a revoked issuer failure', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: false },
+      nowUnixSeconds: 1_900_000_000,
+    })
 
-    expect(
-      resolveTrustReasonCode({
-        status: 'error',
-        errorCode: 'METADATA_ENVELOPE_MISMATCH',
-        issuerTrustState: 'trusted',
-        chainProof: SEAL_PROOF,
-      }),
-    ).toBe('INVALID_SIGNATURE')
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('failed')
+    expect(result.dimensions.issuerTrust.code).toBe('ISSUER_REVOKED')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['issuerTrust'])
   })
 
-  it('preserves fail-closed INVALID_SIGNATURE even in offline mode', () => {
-    expect(
-      resolveTrustReasonCode({
-        offline: true,
-        status: 'error',
-        errorCode: 'INVALID_EVIDENCE',
-      }),
-    ).toBe('INVALID_SIGNATURE')
+  it('does not let valid chain, issuer, and freshness mask a metadata envelope mismatch', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      metadataEnvelopeMismatch: true,
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
+    })
+
+    expect(result.dimensions.contentIntegrity.state).toBe('failed')
+    expect(result.dimensions.contentIntegrity.code).toBe('METADATA_ENVELOPE_MISMATCH')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['contentIntegrity'])
   })
 
-  it('maps offline verification without signature failure to OFFLINE_NOT_CHECKED', () => {
-    expect(
-      resolveTrustReasonCode({
-        offline: true,
-        status: 'success',
-        errorCode: null,
-      }),
-    ).toBe('OFFLINE_NOT_CHECKED')
+  it('does not let valid content and freshness mask a revoked chain record', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: makeChainProof({ status: 2, expiresAt: 0 }),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+    })
+
+    expect(result.dimensions.chainRegistration.state).toBe('failed')
+    expect(result.dimensions.chainRegistration.code).toBe('CHAIN_REVOKED')
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['chainRegistration'])
   })
 
-  it.each([
-    ['trusted', 'TRUSTED_ISSUER'],
-    ['unknown', 'UNKNOWN_ISSUER'],
-    ['revoked', 'REVOKED_ISSUER'],
-    ['expired', 'EXPIRED_ENDORSEMENT'],
-    ['malformed', 'MALFORMED_ISSUER'],
-    ['oversized', 'MALFORMED_ISSUER'],
-    ['unavailable', 'ISSUER_LOOKUP_UNAVAILABLE'],
-    ['checking', 'ISSUER_CHECK_PENDING'],
-    ['unsupported', 'NO_ISSUER_REQUIRED'],
-  ] as const)('maps issuerTrustState %s to %s', (state, expected) => {
-    expect(resolveTrustReasonCode({ issuerTrustState: state, chainProof: SEAL_PROOF })).toBe(expected)
-  })
+  it('marks network-dependent dimensions unverified in offline mode and never verified overall', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: null,
+      offline: true,
+    })
 
-  it('falls back to chainProof address classification when issuerTrustState is omitted', () => {
-    expect(resolveTrustReasonCode({ chainProof: SILENT_PROOF })).toBe('NO_ISSUER_REQUIRED')
-    expect(resolveTrustReasonCode({ chainProof: { ...SEAL_PROOF, issuer: 'not-a-strkey' } })).toBe('MALFORMED_ISSUER')
-    expect(resolveTrustReasonCode({ chainProof: SEAL_PROOF })).toBe('ISSUER_CHECK_PENDING')
-    expect(resolveTrustReasonCode({})).toBeNull()
-  })
-
-  it('explainVerificationTrust returns null when no reason applies', () => {
-    expect(explainVerificationTrust({ status: 'idle', chainProof: null, errorCode: null })).toBeNull()
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('unverified')
+    expect(result.dimensions.issuerTrust.state).toBe('unverified')
+    expect(result.dimensions.freshness.state).toBe('unverified')
+    expect(result.overall).toBe('incomplete')
+    expect(result.hasFailure).toBe(false)
   })
 })
 
-describe('runVerificationFlow and verifyUploadedVideo', () => {
-  it('preserves existing result shape and attaches trust explanation for unknown issuer', async () => {
-    const svc = await import('./verificationService')
-    vi.mocked(svc.fetchProofEventsByVideo).mockResolvedValueOnce([
+describe('runVerificationFlow & verifyUploadedVideo', () => {
+  it('returns structured trust dimensions alongside existing result fields', async () => {
+    vi.mocked(fetchProofEventsByVideo).mockResolvedValueOnce([
       {
         id: 1,
-        event_type: 'registered',
-        file_name: null,
+        event_type: 'proof_registered',
+        file_name: 'sample.mp4',
         video_hash: VALID_HASH,
-        proof_id: 'c'.repeat(64),
-        tier: 'seal',
+        proof_id: 'p'.repeat(64),
+        tier: 'source',
         created_at: '2026-01-01T00:00:00Z',
       },
     ])
-    vi.mocked(svc.getOnChainProof).mockResolvedValueOnce(SEAL_PROOF)
-
-    const result = await runVerificationFlow(VALID_HASH, { issuerTrustState: 'unknown' })
-
-    expect(result.videoHash).toBe(VALID_HASH)
-    expect(result.hasHarpocratesMetadata).toBe(true)
-    expect(result.events).toHaveLength(1)
-    expect(result.onChain).toEqual(SEAL_PROOF)
-    expect(result.trustReasonCode).toBe('UNKNOWN_ISSUER')
-    expect(result.trustExplanation?.heading).toMatch(/unknown issuer/i)
-  })
-
-  it('attaches NO_ISSUER_REQUIRED for Tier 1 proofs without an issuer', async () => {
-    const svc = await import('./verificationService')
-    vi.mocked(svc.fetchProofEventsByVideo).mockResolvedValueOnce([])
-    vi.mocked(svc.getOnChainProof).mockResolvedValueOnce(SILENT_PROOF)
+    vi.mocked(getOnChainProof).mockResolvedValueOnce(
+      makeChainProof({ tier: 1, expiresAt: 0 }),
+    )
 
     const result = await runVerificationFlow(VALID_HASH)
 
-    expect(result.onChain).toEqual(SILENT_PROOF)
-    expect(result.trustReasonCode).toBe('NO_ISSUER_REQUIRED')
+    expect(result.videoHash).toBe(VALID_HASH)
+    expect(result.hasHarpocratesMetadata).toBe(true)
+    expect(result.trust.overall).toBe('verified')
+    expect(result.trust.dimensions.issuerTrust.code).toBe('SOURCE_ATTRIBUTED')
   })
 
-  it('verifyUploadedVideo combines extraction with trust explanation', async () => {
-    const svc = await import('./verificationService')
-    vi.mocked(svc.extractMetadata).mockResolvedValueOnce({ hasHarpocratesMetadata: true })
-    vi.mocked(svc.fetchProofEventsByVideo).mockResolvedValueOnce([])
-    vi.mocked(svc.getOnChainProof).mockResolvedValueOnce(SEAL_PROOF)
+  it('recomputes trust dimensions using extracted metadata in verifyUploadedVideo', async () => {
+    vi.mocked(extractMetadata).mockResolvedValueOnce({ hasHarpocratesMetadata: false })
+    vi.mocked(fetchProofEventsByVideo).mockResolvedValueOnce([])
+    vi.mocked(getOnChainProof).mockResolvedValueOnce(
+      makeChainProof({ tier: 0, expiresAt: 0 }),
+    )
 
-    const file = new File([new Uint8Array([1, 2, 3])], 'synthetic.mp4', { type: 'video/mp4' })
-    const result = await verifyUploadedVideo(file, VALID_HASH, { issuerTrustState: 'unknown' })
+    const file = new File(['synthetic'], 'synthetic.mp4', { type: 'video/mp4' })
+    const result = await verifyUploadedVideo(file, VALID_HASH)
 
-    expect(result.hasHarpocratesMetadata).toBe(true)
-    expect(result.trustReasonCode).toBe('UNKNOWN_ISSUER')
-    expect(result.trustExplanation?.signatureDistinction).toMatch(/not an invalid signature/i)
+    expect(result.hasHarpocratesMetadata).toBe(false)
+    expect(result.trust.dimensions.contentIntegrity.state).toBe('unverified')
+    expect(result.trust.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.trust.overall).toBe('incomplete')
+  })
+})
+
+describe('cached verification context binding', () => {
+  function makeContext(
+    overrides: {
+      statement?: Partial<VerificationContextIdentity['statement']>
+      trustSnapshot?: Partial<VerificationContextIdentity['trustSnapshot']>
+    } = {},
+  ): VerificationContextIdentity {
+    return {
+      statement: {
+        videoHash: VALID_HASH,
+        proofId: 'c'.repeat(64),
+        metadataHash: 'b'.repeat(64),
+        ...overrides.statement,
+      },
+      trustSnapshot: {
+        network: 'Test SDF Network ; September 2015',
+        contractId: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+        offline: false,
+        networkMismatch: null,
+        ...overrides.trustSnapshot,
+      },
+    }
+  }
+
+  it('reuses a cached result when statement and trust snapshot identity match', () => {
+    const context = makeContext()
+    const entry = createCachedVerificationEntry(context, 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(entry, makeContext({
+        statement: { videoHash: VALID_HASH.toUpperCase() },
+      })),
+    ).toEqual({
+      usable: true,
+      result: 'Confirmed: verified',
+    })
+  })
+
+  it('rejects a cached result when statement identity changes', () => {
+    const entry = createCachedVerificationEntry(makeContext(), 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ statement: { videoHash: 'd'.repeat(64) } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ statement: { proofId: 'e'.repeat(64) } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+  })
+
+  it('rejects a cached result when trust snapshot identity changes or network mismatches', () => {
+    const entry = createCachedVerificationEntry(makeContext(), 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { offline: true } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { network: 'Public Global Stellar Network ; September 2015' } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { networkMismatch: 'Wallet is on Mainnet' } }),
+      ),
+    ).toEqual({ usable: false, reason: 'NETWORK_MISMATCH' })
+  })
+
+  it('treats missing cache or empty videoHash as incompatible', () => {
+    const emptyHashContext = makeContext({ statement: { videoHash: '   ' } })
+    expect(resolveCachedVerificationResult(null, makeContext())).toEqual({
+      usable: false,
+      reason: 'MISSING_CACHE',
+    })
+    expect(isVerificationContextCompatible(emptyHashContext, emptyHashContext)).toBe(false)
+    expect(buildVerificationContextKey(makeContext())).not.toBe(
+      buildVerificationContextKey(makeContext({ trustSnapshot: { offline: true } })),
+    )
   })
 })
